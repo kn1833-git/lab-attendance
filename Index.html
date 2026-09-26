@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>研究室 入退室記録</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    :root { color-scheme:light; --blue:#1565c0; --red:#c62828; --ink:#17324d; --muted:#64748b; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#eef3f8; color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Segoe UI",sans-serif; }
+    .app { min-height:100vh; max-width:920px; margin:0 auto; padding:18px; display:flex; flex-direction:column; gap:14px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    h1 { margin:0; font-size:clamp(22px,4vw,34px); }
+    #clock { font-size:clamp(18px,3vw,28px); font-variant-numeric:tabular-nums; color:#334155; }
+    .actions { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    button { border:0; border-radius:18px; color:white; min-height:92px; font-size:clamp(28px,6vw,48px); font-weight:800; box-shadow:0 5px 14px rgba(15,23,42,.16); cursor:pointer; }
+    #inBtn { background:var(--blue); }
+    #outBtn { background:var(--red); }
+    button.selected { outline:7px solid #facc15; transform:translateY(-2px); }
+    button:disabled { opacity:.55; }
+    .panel { background:white; border-radius:20px; padding:16px; box-shadow:0 4px 14px rgba(15,23,42,.09); }
+    #instruction { text-align:center; font-size:clamp(18px,3vw,26px); font-weight:700; margin:0 0 12px; }
+    #reader { width:100%; min-height:320px; overflow:hidden; border-radius:16px; background:#101820; }
+    #reader video { object-fit:cover; }
+    #result { min-height:122px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; border-radius:18px; padding:12px; background:#e8eef5; }
+    #result.ok { background:#dcfce7; color:#14532d; }
+    #result.error { background:#ffedd5; color:#9a3412; }
+    #result .main { font-size:clamp(24px,5vw,40px); font-weight:900; }
+    #result .sub { font-size:clamp(17px,3vw,24px); margin-top:4px; }
+    #retry { display:none; background:#475569; min-height:58px; width:100%; margin-top:10px; font-size:22px; }
+    .footer { text-align:center; color:var(--muted); font-size:14px; }
+    @media (orientation:landscape) and (min-width:760px) {
+      .bodygrid { display:grid; grid-template-columns:1.15fr .85fr; gap:14px; align-items:start; }
+      #reader { min-height:380px; }
+      .side { display:flex; flex-direction:column; gap:14px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header><h1 id="title">研究室 入退室記録</h1><div id="clock">--:--:--</div></header>
+    <div class="bodygrid">
+      <section class="panel">
+        <p id="instruction">［入室］または［退室］を押してください</p>
+        <div id="reader"></div>
+        <button id="retry" type="button">カメラを再試行</button>
+      </section>
+      <div class="side">
+        <section class="actions">
+          <button id="inBtn" type="button">入 室</button>
+          <button id="outBtn" type="button">退 室</button>
+        </section>
+        <section id="result" aria-live="polite">
+          <div class="main">操作を選んでください</div>
+          <div class="sub">選択後、スマホのQRをカメラへ</div>
+        </section>
+      </div>
+    </div>
+    <div class="footer">QRは画面中央に1つだけ映してください</div>
+  </main>
+
+  <script>
+    // ★★★ ここだけ変更してください ★★★
+    // Apps Scriptをウェブアプリとしてデプロイした後の /exec URL を貼ります。
+    const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzOL8ZxvD7kAD9Wtb1heAPGmLTzNQz6qm5Lzkmr6iCEqMZB1FdOZvZ_ZmAoST6-rHn7MA/exec';
+
+    let selectedAction = null;
+    let scanner = null;
+    let cameraStarted = false;
+    let processing = false;
+    let audioContext = null;
+    let jsonpSequence = 0;
+
+    const instruction = document.getElementById('instruction');
+    const result = document.getElementById('result');
+    const inBtn = document.getElementById('inBtn');
+    const outBtn = document.getElementById('outBtn');
+    const retry = document.getElementById('retry');
+
+    inBtn.addEventListener('click', () => selectAction('IN'));
+    outBtn.addEventListener('click', () => selectAction('OUT'));
+    retry.addEventListener('click', () => startCamera());
+
+    function updateClock() {
+      document.getElementById('clock').textContent = new Intl.DateTimeFormat('ja-JP', {
+        hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+      }).format(new Date());
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    function apiConfigured() {
+      return /^https:\/\/script\.google\.com\/.+\/exec(?:$|[?#])/.test(APPS_SCRIPT_URL);
+    }
+
+    function jsonp(params, timeoutMs = 12000) {
+      return new Promise((resolve, reject) => {
+        if (!apiConfigured()) {
+          reject(new Error('GitHub_Index.html の APPS_SCRIPT_URL を設定してください。'));
+          return;
+        }
+
+        const callbackName = '__attendanceJsonp' + Date.now() + '_' + (++jsonpSequence);
+        const script = document.createElement('script');
+        const timer = setTimeout(() => cleanup(new Error('Apps Scriptから応答がありません。')), timeoutMs);
+
+        function cleanup(error, data) {
+          clearTimeout(timer);
+          try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
+          script.remove();
+          error ? reject(error) : resolve(data);
+        }
+
+        window[callbackName] = data => cleanup(null, data);
+        script.onerror = () => cleanup(new Error('Apps Scriptへの通信に失敗しました。'));
+
+        const url = new URL(APPS_SCRIPT_URL);
+        Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+        url.searchParams.set('callback', callbackName);
+        url.searchParams.set('_', String(Date.now()));
+        script.src = url.toString();
+        document.head.appendChild(script);
+      });
+    }
+
+    async function loadConfig() {
+      try {
+        const config = await jsonp({ api:'config' });
+        if (config && config.ok && config.labName) {
+          document.getElementById('title').textContent = config.labName;
+          document.title = config.labName;
+        }
+      } catch (error) {
+        console.error(error);
+        showMessage(false, '設定を確認してください', error.message);
+      }
+    }
+    loadConfig();
+
+    async function selectAction(action) {
+      selectedAction = action;
+      inBtn.classList.toggle('selected', action === 'IN');
+      outBtn.classList.toggle('selected', action === 'OUT');
+      instruction.textContent = (action === 'IN' ? '入室' : '退室') + '：QRコードをかざしてください';
+      result.className = '';
+      result.innerHTML = '<div class="main">' + (action === 'IN' ? '入室' : '退室') + 'を選択中</div><div class="sub">QRをカメラへ</div>';
+      ensureAudio();
+      if (!cameraStarted) await startCamera();
+    }
+
+    async function startCamera() {
+      retry.style.display = 'none';
+      try {
+        if (!window.isSecureContext) throw new Error('HTTPSで開いてください。');
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('このブラウザではカメラAPIを利用できません。');
+        }
+        if (!scanner) scanner = new Html5Qrcode('reader');
+        await scanner.start(
+          { facingMode:'environment' },
+          {
+            fps:10,
+            qrbox:(w, h) => {
+              const s = Math.floor(Math.min(w, h) * .70);
+              return { width:s, height:s };
+            }
+          },
+          onScanSuccess,
+          () => {}
+        );
+        cameraStarted = true;
+      } catch (error) {
+        console.error('Camera start error:', error);
+        cameraStarted = false;
+        instruction.textContent = 'カメラを開始できません';
+        const detail = [error && error.name, error && error.message].filter(Boolean).join('：') || '不明なエラー';
+        showMessage(false, 'カメラを開始できません', detail);
+        retry.style.display = 'block';
+      }
+    }
+
+    async function onScanSuccess(decodedText) {
+      if (processing || !selectedAction) return;
+      processing = true;
+      inBtn.disabled = true;
+      outBtn.disabled = true;
+      try { scanner.pause(true); } catch (_) {}
+      showMessage(true, '記録しています…', 'そのままお待ちください');
+
+      try {
+        const data = await jsonp({
+          api:'record',
+          qr:decodedText,
+          action:selectedAction,
+          clientTime:new Date().toISOString()
+        });
+        handleServerResult(data);
+      } catch (error) {
+        console.error(error);
+        handleServerResult({ ok:false, message:error.message || '通信に失敗しました。' });
+      }
+    }
+
+    function handleServerResult(data) {
+      if (data && data.ok) {
+        showMessage(true, '✓ ' + data.name + 'さん', data.actionLabel + '　' + data.time);
+        beep(880, 0.13);
+      } else {
+        showMessage(false, '記録しませんでした', (data && data.message) || 'QRを確認してください。');
+        beep(220, 0.22);
+      }
+      setTimeout(resetForNextPerson, 2400);
+    }
+
+    function resetForNextPerson() {
+      processing = false;
+      selectedAction = null;
+      inBtn.disabled = false;
+      outBtn.disabled = false;
+      clearSelection();
+      instruction.textContent = '［入室］または［退室］を押してください';
+      result.className = '';
+      result.innerHTML = '<div class="main">次の方</div><div class="sub">操作を選んでください</div>';
+      try { scanner.resume(); } catch (_) {}
+    }
+
+    function clearSelection() {
+      inBtn.classList.remove('selected');
+      outBtn.classList.remove('selected');
+    }
+
+    function showMessage(ok, main, sub) {
+      result.className = ok ? 'ok' : 'error';
+      result.innerHTML = '<div class="main"></div><div class="sub"></div>';
+      result.querySelector('.main').textContent = main;
+      result.querySelector('.sub').textContent = sub;
+    }
+
+    function ensureAudio() {
+      if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioContext.state === 'suspended') audioContext.resume();
+    }
+
+    function beep(frequency, duration) {
+      try {
+        ensureAudio();
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        oscillator.frequency.value = frequency;
+        gain.gain.setValueAtTime(.13, audioContext.currentTime);
+        gain.gain.exponentialRampToValueAtTime(.001, audioContext.currentTime + duration);
+        oscillator.connect(gain);
+        gain.connect(audioContext.destination);
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + duration);
+      } catch (_) {}
+    }
+  </script>
+</body>
+</html>
